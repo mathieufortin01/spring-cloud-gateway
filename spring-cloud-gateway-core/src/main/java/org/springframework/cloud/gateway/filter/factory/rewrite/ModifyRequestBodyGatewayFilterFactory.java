@@ -1,50 +1,58 @@
 /*
- * Copyright 2013-2018 the original author or authors.
+ * Copyright 2013-2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
 package org.springframework.cloud.gateway.filter.factory.rewrite;
 
+import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
-import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
-import org.springframework.core.ResolvableType;
+import org.springframework.cloud.gateway.support.BodyInserterContext;
+import org.springframework.cloud.gateway.support.CachedBodyOutputMessage;
+import org.springframework.cloud.gateway.support.DefaultServerRequest;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.http.codec.HttpMessageReader;
-import org.springframework.http.codec.HttpMessageWriter;
 import org.springframework.http.codec.ServerCodecConfigurer;
 import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.web.reactive.function.BodyInserter;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.server.HandlerStrategies;
+import org.springframework.web.reactive.function.server.ServerRequest;
 
-import static org.springframework.cloud.gateway.filter.factory.rewrite.RewriteUtils.process;
+/**
+ * This filter is BETA and may be subject to change in a future release.
+ */
+public class ModifyRequestBodyGatewayFilterFactory extends
+		AbstractGatewayFilterFactory<ModifyRequestBodyGatewayFilterFactory.Config> {
 
-public class ModifyRequestBodyGatewayFilterFactory
-		extends AbstractGatewayFilterFactory<ModifyRequestBodyGatewayFilterFactory.Config> {
+	private final List<HttpMessageReader<?>> messageReaders;
 
-	private final ServerCodecConfigurer codecConfigurer;
-
-	public ModifyRequestBodyGatewayFilterFactory(ServerCodecConfigurer codecConfigurer) {
+	public ModifyRequestBodyGatewayFilterFactory() {
 		super(Config.class);
-		this.codecConfigurer = codecConfigurer;
+		this.messageReaders = HandlerStrategies.withDefaults().messageReaders();
+	}
+
+	@Deprecated
+	public ModifyRequestBodyGatewayFilterFactory(ServerCodecConfigurer codecConfigurer) {
+		this();
 	}
 
 	@Override
@@ -52,65 +60,75 @@ public class ModifyRequestBodyGatewayFilterFactory
 	public GatewayFilter apply(Config config) {
 		return (exchange, chain) -> {
 			Class inClass = config.getInClass();
+			ServerRequest serverRequest = new DefaultServerRequest(exchange,
+					this.messageReaders);
 
-			MediaType mediaType = exchange.getRequest().getHeaders().getContentType();
-			ResolvableType inElementType = ResolvableType.forClass(inClass);
-			Optional<HttpMessageReader<?>> reader = RewriteUtils.getHttpMessageReader(codecConfigurer, inElementType, mediaType);
+			// TODO: flux or mono
+			Mono<?> modifiedBody = serverRequest.bodyToMono(inClass)
+					// .log("modify_request_mono", Level.INFO)
+					.flatMap(o -> config.rewriteFunction.apply(exchange, o));
 
-			if (reader.isPresent()) {
-				Mono<Object> readMono = reader.get()
-						.readMono(inElementType, exchange.getRequest(), config.getInHints())
-						.cast(Object.class);
+			BodyInserter bodyInserter = BodyInserters.fromPublisher(modifiedBody,
+					config.getOutClass());
+			HttpHeaders headers = new HttpHeaders();
+			headers.putAll(exchange.getRequest().getHeaders());
 
-				return process(readMono, peek -> {
-					ResolvableType outElementType = ResolvableType
-							.forClass(config.getOutClass());
-					Optional<HttpMessageWriter<?>> writer = RewriteUtils.getHttpMessageWriter(codecConfigurer, outElementType, mediaType);
+			// the new content type will be computed by bodyInserter
+			// and then set in the request decorator
+			headers.remove(HttpHeaders.CONTENT_LENGTH);
 
-					if (writer.isPresent()) {
-						Object data = config.rewriteFunction.apply(exchange, peek);
-
-						//TODO: deal with multivalue? ie Flux
-						Publisher publisher = Mono.just(data);
-
-						HttpMessageWriterResponse fakeResponse = new HttpMessageWriterResponse(exchange.getResponse().bufferFactory());
-						writer.get().write(publisher, inElementType, mediaType,
-								fakeResponse, config.getOutHints());
+			// if the body is changing content types, set it here, to the bodyInserter
+			// will know about it
+			if (config.getContentType() != null) {
+				headers.set(HttpHeaders.CONTENT_TYPE, config.getContentType());
+			}
+			CachedBodyOutputMessage outputMessage = new CachedBodyOutputMessage(exchange,
+					headers);
+			return bodyInserter.insert(outputMessage, new BodyInserterContext())
+					// .log("modify_request", Level.INFO)
+					.then(Mono.defer(() -> {
 						ServerHttpRequestDecorator decorator = new ServerHttpRequestDecorator(
 								exchange.getRequest()) {
 							@Override
 							public HttpHeaders getHeaders() {
+								long contentLength = headers.getContentLength();
 								HttpHeaders httpHeaders = new HttpHeaders();
 								httpHeaders.putAll(super.getHeaders());
-								// TODO: this causes a 'HTTP/1.1 411 Length Required' on
-								// httpbin.org
-								httpHeaders.set(HttpHeaders.TRANSFER_ENCODING, "chunked");
-								if (fakeResponse.getHeaders().getContentType() != null) {
-									httpHeaders.setContentType(
-											fakeResponse.getHeaders().getContentType());
+								if (contentLength > 0) {
+									httpHeaders.setContentLength(contentLength);
+								}
+								else {
+									// TODO: this causes a 'HTTP/1.1 411 Length Required'
+									// on httpbin.org
+									httpHeaders.set(HttpHeaders.TRANSFER_ENCODING,
+											"chunked");
 								}
 								return httpHeaders;
 							}
 
 							@Override
 							public Flux<DataBuffer> getBody() {
-								return (Flux<DataBuffer>) fakeResponse.getBody();
+								return outputMessage.getBody();
 							}
 						};
 						return chain.filter(exchange.mutate().request(decorator).build());
-					}
-					return chain.filter(exchange);
-				});
+					}));
 
-			}
-			return chain.filter(exchange);
 		};
 	}
 
 	public static class Config {
+
 		private Class inClass;
+
 		private Class outClass;
+
+		private String contentType;
+
+		@Deprecated
 		private Map<String, Object> inHints;
+
+		@Deprecated
 		private Map<String, Object> outHints;
 
 		private RewriteFunction rewriteFunction;
@@ -133,19 +151,23 @@ public class ModifyRequestBodyGatewayFilterFactory
 			return this;
 		}
 
+		@Deprecated
 		public Map<String, Object> getInHints() {
 			return inHints;
 		}
 
+		@Deprecated
 		public Config setInHints(Map<String, Object> inHints) {
 			this.inHints = inHints;
 			return this;
 		}
 
+		@Deprecated
 		public Map<String, Object> getOutHints() {
 			return outHints;
 		}
 
+		@Deprecated
 		public Config setOutHints(Map<String, Object> outHints) {
 			this.outHints = outHints;
 			return this;
@@ -153,6 +175,11 @@ public class ModifyRequestBodyGatewayFilterFactory
 
 		public RewriteFunction getRewriteFunction() {
 			return rewriteFunction;
+		}
+
+		public Config setRewriteFunction(RewriteFunction rewriteFunction) {
+			this.rewriteFunction = rewriteFunction;
+			return this;
 		}
 
 		public <T, R> Config setRewriteFunction(Class<T> inClass, Class<R> outClass,
@@ -163,9 +190,15 @@ public class ModifyRequestBodyGatewayFilterFactory
 			return this;
 		}
 
-		public Config setRewriteFunction(RewriteFunction rewriteFunction) {
-			this.rewriteFunction = rewriteFunction;
+		public String getContentType() {
+			return contentType;
+		}
+
+		public Config setContentType(String contentType) {
+			this.contentType = contentType;
 			return this;
 		}
+
 	}
+
 }
